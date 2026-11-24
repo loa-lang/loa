@@ -100,10 +100,24 @@ public extension Loa {
                 .field("value", p("expression")), .literal(";")
             ])),
 
-            // Types: `Message`, `Message?`, `[String]`, `[String: Int]`, `.{ .name: Type }`.
+            // Types: `Message`, `Message?`, `[String]`, `[String: Int]`, `.{ .name: Type = default }`,
+            // and case unions `.low | .high`, `.text(string)`, `.replace(old: string, new: string)`.
             .init(name: "type", expression: .sequence([
-                .choice([p("collection_type"), p("object_type"), p("named_type")]),
+                .choice([p("collection_type"), p("object_type"), p("case_union"), p("named_type")]),
                 .optional(.field("optional", .literal("?")))
+            ])),
+            .init(name: "case_union", expression: .sequence([
+                p("case_type"),
+                .repeat0(.sequence([.literal("|"), p("case_type")]))
+            ])),
+            .init(name: "case_type", expression: .sequence([
+                .literal("."), .field("name", name),
+                .optional(.sequence([.literal("("), .optional(p("case_parameters")), .literal(")")]))
+            ])),
+            .init(name: "case_parameters", expression: list("case_parameter", "case_parameters")),
+            .init(name: "case_parameter", expression: .sequence([
+                .optional(.sequence([.field("label", name), .literal(":")])),
+                .field("type", p("type"))
             ])),
             .init(name: "collection_type", expression: .sequence([
                 .literal("["), .field("element", p("type")),
@@ -115,7 +129,8 @@ public extension Loa {
             ])),
             .init(name: "type_fields", expression: list("type_field", "type_fields")),
             .init(name: "type_field", expression: .sequence([
-                .literal("."), .field("name", name), .literal(":"), .field("type", p("type"))
+                .literal("."), .field("name", name), .literal(":"), .field("type", p("type")),
+                .optional(.sequence([.literal("="), .field("default", p("expression"))]))
             ])),
             .init(name: "named_type", expression: .sequence([
                 identifier, .repeat0(.sequence([.literal("."), identifier]))
@@ -225,6 +240,9 @@ public extension Loa {
                 .field(production: "implicit_member", name: "name", role: "constant"),
                 .field(production: "object_field", name: "name", role: "property"),
                 .field(production: "type_field", name: "name", role: "property"),
+                .field(production: "case_type", name: "name", role: "constant"),
+                .field(production: "case_parameter", name: "label", role: "property"),
+                .literal("|", role: "operator"),
                 .field(production: "argument", name: "label", role: "property"),
                 .literal("=", role: "operator"),
                 .literal("+=", role: "operator"),

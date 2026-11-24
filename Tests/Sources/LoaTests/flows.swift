@@ -99,6 +99,145 @@ enum LoaTestSuite {
             }
         }
 
+        Test("every design example builds its abstract syntax") {
+            for fixture in Fixtures.all {
+                do {
+                    _ = try Loa.parse(fixture.source, filePath: "\(fixture.name).loa")
+                } catch {
+                    throw Loa.SyntaxFailure(message: "\(fixture.name).loa: \(error)")
+                }
+            }
+            let mail = try Loa.parse(Fixtures.mail)
+            try Expect.equal(mail.pages.map(\.name), ["find"], "pages")
+            try Expect.equal(mail.pages[0].body.count, 6, "statements in page find")
+        }
+
+        Test("operators group by precedence and fold to the left") {
+            let cases: [(String, String)] = [
+                ("1 + 2 * 3", "(+ 1 (* 2 3))"),
+                ("a - b - c", "(- (- a b) c)"),
+                ("x ?? y |> f()", "(|> (?? x y) f())"),
+                ("!done && count > 0 || force", "(|| (&& (! done) (> count 0)) force)"),
+                ("1...60", "(... 1 60)"),
+                (".severity == .error", "(== .severity .error)"),
+                ("try swift.build(package: \"Loa\")", "(try swift.build(package: \"Loa\"))"),
+                ("-(a + b)", "(- (+ a b))"),
+            ]
+            for (source, expected) in cases {
+                let value = try expressionValue(source)
+                try Expect.equal(value, expected, source)
+            }
+        }
+
+        Test("postfix chains: members, calls with labels, subscripts, implicit members") {
+            try Expect.equal(
+                try expressionValue("mail.search(account: \"levi\", limit: 20).messages[0].subject"),
+                "mail.search(account: \"levi\", limit: 20).messages[0].subject",
+                "chain"
+            )
+            try Expect.equal(
+                try expressionValue("hits.where(!.path.contains(\"/Testing/\"))"),
+                "hits.where((! .path.contains(\"/Testing/\")))",
+                "implicit member chain under a prefix"
+            )
+            try Expect.equal(
+                try expressionValue(".{ .a = 1, .b = [.x, \"y\"], .c = [:], }"),
+                ".{ .a = 1, .b = [.x, \"y\"], .c = [:] }",
+                "objects, arrays, empty dictionaries"
+            )
+        }
+
+        Test("strings decode escapes, split interpolation and dedent block strings") {
+            try Expect.equal(try expressionValue(#""tab\there \"q\" \u{e9}""#), "\"tab\there \\\"q\\\" é\"", "escapes")
+            let interpolated = try Loa.parse(#"let p = "\(area)/\(date.today())-x.md";"#)
+            guard case .binding(let binding)? = interpolated.statements.first?.kind,
+                  case .string(let literal) = binding.value.kind else {
+                throw Loa.SyntaxFailure(message: "expected a string binding")
+            }
+            try Expect.equal(literal.segments.count, 4, "interpolation, text, interpolation, text")
+            try Expect.equal(literal.description, #""\(area)/\(date.today())-x.md""#, "segments")
+            try Expect.equal(literal.constant, nil, "not constant")
+            let block = try Loa.parse("""
+                let body = \"\"\"
+                    Beste Client A,
+
+                      ingesprongen
+                    \"\"\";
+                """)
+            guard case .binding(let text)? = block.statements.first?.kind,
+                  case .string(let blockLiteral) = text.value.kind else {
+                throw Loa.SyntaxFailure(message: "expected a block string binding")
+            }
+            try Expect.equal(blockLiteral.constant, "Beste Client A,\n\n  ingesprongen", "dedented")
+        }
+
+        Test("statements: bindings, assignment, for, if / else if / else, step, return") {
+            let program = try Loa.parse("""
+                page p {
+                    var total: Int = 0;
+                    for x in [1, 2] {
+                        total += x;
+                    }
+                    if total > 2 {
+                        return total;
+                    } else if total == 0 {
+                        break;
+                    } else {
+                        continue;
+                    }
+                    step tail {
+                        done();
+                    }
+                }
+                """)
+            let body = program.pages[0].body
+            try Expect.equal(body.count, 4, "four statements")
+            guard case .binding(let binding) = body[0].kind else {
+                throw Loa.SyntaxFailure(message: "expected binding")
+            }
+            try Expect.equal(binding.mutable, true, "var")
+            try Expect.equal(binding.type, .named(["Int"]), "type")
+            guard case .if(_, _, let otherwise?) = body[2].kind,
+                  case .if(_, _, let last?) = otherwise.first?.kind,
+                  case .continue = last.first?.kind else {
+                throw Loa.SyntaxFailure(message: "expected if / else if / else")
+            }
+            guard case .step(let name, let steps) = body[3].kind else {
+                throw Loa.SyntaxFailure(message: "expected step")
+            }
+            try Expect.equal(name, "tail", "step name")
+            try Expect.equal(steps.count, 1, "step body")
+        }
+
+        Test("types: case unions with associated values, field defaults, optionals") {
+            let program = try Loa.parse("""
+                type Priority = .low | .normal | .urgent;
+                type Edit = .replace(old: string, new: string) | .insert(string) | .remove;
+                type Search = .{
+                    .text: string,
+                    .limit: int = 20,
+                    .since: Day? = null,
+                    .mode: .fast | .careful = .fast,
+                };
+                """)
+            let rendered = program.types.map { "\($0.name) = \($0.type)" }
+            try Expect.equal(rendered, [
+                "Priority = .low | .normal | .urgent",
+                "Edit = .replace(old: string, new: string) | .insert(string) | .remove",
+                "Search = .{ .text: string, .limit: int = 20, .since: Day? = null, .mode: .fast | .careful = .fast }",
+            ], "types")
+        }
+
+        Test("ranges point at the source") {
+            let source = "let found = mail.search(account: \"levi\");"
+            let program = try Loa.parse(source)
+            guard case .binding(let binding)? = program.statements.first?.kind else {
+                throw Loa.SyntaxFailure(message: "expected binding")
+            }
+            let bytes = Array(source.utf8)[binding.value.range]
+            try Expect.equal(String(decoding: bytes, as: UTF8.self), "mail.search(account: \"levi\")", "call range")
+        }
+
         Test("outside the P1 grammar: trailing closures and for-expressions") {
             try Expect.throwsError("trailing closure") {
                 _ = try Loa.syntax("let x = hits.where { hit in hit.ok };")
@@ -108,6 +247,15 @@ enum LoaTestSuite {
             }
         }
     }
+}
+
+/// The rendering of `source` parsed as the value of a binding.
+func expressionValue(_ source: String) throws -> String {
+    let program = try Loa.parse("let value = \(source);")
+    guard case .binding(let binding)? = program.statements.first?.kind else {
+        throw Loa.SyntaxFailure(message: "expected a binding for \(source)")
+    }
+    return binding.value.description
 }
 
 extension GrammarParser.Node {
