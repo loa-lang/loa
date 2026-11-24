@@ -214,7 +214,7 @@ enum Fixtures {
                 path: "~/main/plans"
             );
 
-            let ours = goal.written_files;
+            var ours = goal.written_files;
 
             let foreign = state.changes.where(
                 !ours.contains(.path)
@@ -245,7 +245,7 @@ enum Fixtures {
             );
 
             mail.request_access(
-                targets: accounts.names,
+                targets: accounts.map(.name),
                 reason: "find the mail about pakwerk"
             );
 

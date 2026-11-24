@@ -4,6 +4,11 @@ import Testing
 
 enum LoaTestSuite {
     static let suite = TestSuite("loa", title: "Loa language") {
+        syntaxSuite
+        checkerSuite
+    }
+
+    static let syntaxSuite = TestSuite("syntax", title: "Syntax and abstract syntax") {
         Test("the grammar is valid and compiles to a native parser") {
             let language = try Loa.language()
             try Expect.equal(language.word, "identifier", "keywords lex as whole words")
