@@ -8,6 +8,7 @@ let package = Package(
         .executable(name: "t_loa", targets: ["LoaTests"]),
     ],
     dependencies: [
+        .package(url: "https://github.com/leviouwendijk/Parsing.git", branch: "master"),
         .package(url: "https://github.com/leviouwendijk/Testing.git", branch: "master"),
         .package(path: ".."),
     ],
@@ -15,6 +16,7 @@ let package = Package(
         .executableTarget(
             name: "LoaTests",
             dependencies: [
+                .product(name: "GrammarParsing", package: "Parsing"),
                 .product(name: "Loa", package: "Loa"),
                 .product(name: "Testing", package: "Testing"),
             ]

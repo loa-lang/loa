@@ -1,5 +1,5 @@
 {
-  "originHash" : "e93d91b14ed1a5b47c736519dfe80867235be1e195985cccec23eec0c27891b1",
+  "originHash" : "16ad6e8453692be550b77395d6987e67b547d68e7496211f6d8aeeac2f3ef830",
   "pins" : [
     {
       "identity" : "atomos",
@@ -34,7 +34,7 @@
       "location" : "https://github.com/leviouwendijk/Frame.git",
       "state" : {
         "branch" : "master",
-        "revision" : "5db8db8a4126e819024c5ce29a23cb68b0ef093c"
+        "revision" : "37cf17f4ad1fb0431429baf52b99af6c5a29af1a"
       }
     },
     {
@@ -61,7 +61,7 @@
       "location" : "https://github.com/leviouwendijk/Lexing.git",
       "state" : {
         "branch" : "master",
-        "revision" : "8af7b5e20aaf123d2908662c238ac5507c68298c"
+        "revision" : "5037b8580634552bb488692067cf3b209e1911e4"
       }
     },
     {
