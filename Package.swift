@@ -9,9 +9,9 @@ let package = Package(
     ],
     dependencies: [
         .package(url: "https://github.com/leviouwendijk/Errors.git", branch: "master"),
-        .package(url: "https://github.com/leviouwendijk/Frame.git", branch: "master"),
-        .package(url: "https://github.com/leviouwendijk/Grammar.git", branch: "master"),
-        .package(url: "https://github.com/leviouwendijk/Parsing.git", branch: "master"),
+        .package(url: "https://github.com/lco-langs/Frame.git", branch: "master"),
+        .package(url: "https://github.com/swift-langs/Grammar.git", branch: "master"),
+        .package(url: "https://github.com/swift-langs/Parsing.git", branch: "master"),
         .package(url: "https://github.com/leviouwendijk/Position.git", branch: "master"),
     ],
     targets: [
