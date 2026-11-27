@@ -23,10 +23,9 @@ public extension Loa {
         func located(in source: String) -> Self {
             guard let offset else { return self }
             var failure = self
-            let before = source.utf8.prefix(offset)
-            let lineStart = before.lastIndex(of: UInt8(ascii: "\n")).map { before.index(after: $0) } ?? before.startIndex
-            failure.line = before.filter { $0 == UInt8(ascii: "\n") }.count + 1
-            failure.column = String(decoding: before[lineStart...], as: UTF8.self).count + 1
+            let location = Loa.location(of: offset, in: Position.TextMap(source: source))
+            failure.line = location?.line
+            failure.column = location?.column
             return failure
         }
     }

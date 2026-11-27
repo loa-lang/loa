@@ -6,6 +6,7 @@ enum LoaTestSuite {
     static let suite = TestSuite("loa", title: "Loa language") {
         syntaxSuite
         checkerSuite
+        interpreterSuite
     }
 
     static let syntaxSuite = TestSuite("syntax", title: "Syntax and abstract syntax") {

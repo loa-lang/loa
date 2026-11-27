@@ -1,3 +1,5 @@
+import Position
+
 public extension Loa {
     struct Diagnostic: Sendable, CustomStringConvertible {
         public enum Severity: String, Sendable {
@@ -19,12 +21,11 @@ public extension Loa {
             return "\(position)\(severity.rawValue): \(message)\(note)"
         }
 
-        func located(in source: String) -> Self {
+        func located(in map: Position.TextMap) -> Self {
             var located = self
-            let before = source.utf8.prefix(range.lowerBound)
-            let lineStart = before.lastIndex(of: UInt8(ascii: "\n")).map { before.index(after: $0) } ?? before.startIndex
-            located.line = before.filter { $0 == UInt8(ascii: "\n") }.count + 1
-            located.column = String(decoding: before[lineStart...], as: UTF8.self).count + 1
+            let location = Loa.location(of: range.lowerBound, in: map)
+            located.line = location?.line
+            located.column = location?.column
             return located
         }
     }
@@ -63,8 +64,9 @@ public extension Loa {
     static func check(_ source: String, catalog: Catalog, filePath: String? = nil) throws -> CheckResult {
         let program = try parse(source, filePath: filePath)
         let result = check(program, catalog: catalog)
+        let map = Position.TextMap(source: source)
         return CheckResult(
-            diagnostics: result.diagnostics.map { $0.located(in: source) },
+            diagnostics: result.diagnostics.map { $0.located(in: map) },
             effects: result.effects
         )
     }
