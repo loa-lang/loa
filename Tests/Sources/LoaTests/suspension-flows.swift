@@ -131,3 +131,58 @@ extension LoaTestSuite {
         }
     }
 }
+
+extension LoaTestSuite {
+    static let hostSuite = TestSuite("host", title: "Hosts: interruptions, answers, catalog reference") {
+        Test("a host error stops the run; the call is pending, so a later run makes it once") {
+            let first = try await SendFake.run(FakeExecutor(interrupting: "mail.send"))
+            try Expect.equal(first.interruption is FakeExecutor.HeldForApproval, true, "the host's error is handed back")
+            try Expect.equal(first.failure == nil && first.suspension == nil, true, "neither a failure nor a suspension")
+            let pending = first.ledger.entries.last.map { entry -> Bool in
+                if case .pending = entry.kind { return true }
+                return false
+            }
+            try Expect.equal(pending, true, "recorded as pending")
+
+            let executor = FakeExecutor { _ in .value(SendFake.receipt) }
+            let second = try await SendFake.run(ledger: first.ledger, executor)
+            let calls = await executor.calls
+            try Expect.equal(calls.count, 1, "runs once afterwards")
+            try Expect.equal(second.succeeded, true, "finished")
+        }
+
+        Test("a host that answers ask now: no suspension, the answer is recorded and checked") {
+            let answered = try await Loa.run(
+                CommitFake.source,
+                catalog: TestCatalog.catalog,
+                executor: FakeExecutor(answer: ["b.md"], CommitFake.answer)
+            )
+            try Expect.equal(answered.succeeded, true, "no suspension")
+            try Expect.equal(answered.value("include", page: "commit"), ["b.md"], "the host's answer")
+            try Expect.equal(answered.ledger.open.isEmpty, true, "nothing open")
+
+            let wrong = try await Loa.run(
+                CommitFake.source,
+                catalog: TestCatalog.catalog,
+                executor: FakeExecutor(answer: "a.md", CommitFake.answer)
+            )
+            try Expect.equal(
+                wrong.failure?.message,
+                "The answer to 'Include these files that this goal did not write?' does not fit: '\("Include these files that this goal did not write?")' takes a list of its options",
+                "an answer that does not fit the question is refused"
+            )
+        }
+
+        Test("the catalog renders as a compact reference for the model") {
+            let reference = TestCatalog.catalog.reference()
+            try Expect.equal(reference.contains("mail (also: email)"), true, "domain with aliases")
+            try Expect.equal(
+                reference.contains("  mail.request_access(targets: [string], level: .read | .draft?, reason: string) -> Grant · ask"),
+                true,
+                "signature with effect"
+            )
+            try Expect.equal(reference.contains("· external, never repeats"), true, "repeats shown when not the default")
+            try Expect.equal(reference.contains("type Account = .{ .name: string, .can_read: bool }"), true, "types")
+        }
+    }
+}

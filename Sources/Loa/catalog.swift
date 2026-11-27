@@ -18,6 +18,53 @@ public extension Loa {
         public var domainNames: [String] {
             domains.flatMap { [$0.name] + $0.aliases }
         }
+
+        /// The catalog as the model reads it: one signature per line, grouped by domain,
+        /// with its effect, then the named types. The same text for every request, so it
+        /// caches.
+        ///
+        /// ```
+        /// mail (also: email)
+        ///   mail.search(text: string?, limit: int?) -> Search · read — Search messages.
+        ///
+        /// type Account = .{ .name: string, .can_read: bool }
+        /// ```
+        public func reference() -> String {
+            var lines: [String] = []
+            for domain in domains {
+                let aliases = domain.aliases.isEmpty ? "" : " (also: \(domain.aliases.joined(separator: ", ")))"
+                lines.append(domain.name + aliases)
+                for function in domain.functions {
+                    var tags = [function.effect.rawValue]
+                    let usual: Repeats = function.effect <= .read ? .safe : .guarded
+                    if function.repeats != usual {
+                        tags.append(function.repeats == .never ? "never repeats" : function.repeats == .safe ? "safe to repeat" : "guarded")
+                    }
+                    let summary = function.summary.isEmpty ? "" : " — \(function.summary)"
+                    lines.append("  \(function.signature(domain: domain.name)) · \(tags.joined(separator: ", "))\(summary)")
+                }
+                lines.append("")
+            }
+            for name in types.keys.sorted() {
+                guard let type = types[name] else { continue }
+                lines.append("type \(name) = \(Self.expanded(type))")
+            }
+            while lines.last == "" { lines.removeLast() }
+            return lines.joined(separator: "\n")
+        }
+
+        /// A type written out one level deep: records with their fields, unions with their cases.
+        static func expanded(_ type: ValueType) -> String {
+            switch type {
+            case .record(let record):
+                let fields = record.fields.map { ".\($0.name): \($0.type)\($0.hasDefault ? " = …" : "")" }
+                return ".{ \(fields.joined(separator: ", ")) }"
+            case .cases(let cases):
+                return cases.names.map { ".\($0)" }.joined(separator: " | ")
+            default:
+                return type.description
+            }
+        }
     }
 
     struct Domain: Sendable {

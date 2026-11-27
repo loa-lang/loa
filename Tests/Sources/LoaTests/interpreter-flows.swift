@@ -8,23 +8,38 @@ actor FakeExecutor: Loa.Executor {
     let handler: Handler
     let settlement: Loa.Settlement
     let release: Loa.ReleaseDecision
+    /// The host's own answer to every `ask`; nil suspends.
+    let answer: Loa.Value?
+    /// Calls to this function throw, as a host holding an approval does.
+    let interrupting: String?
     private(set) var calls: [Loa.Call] = []
     private(set) var settled: [Loa.Call] = []
     private(set) var releases: [Loa.CallRecord] = []
 
+    struct HeldForApproval: Error {}
+
     init(
         settlement: Loa.Settlement = .cannot_tell,
         release: Loa.ReleaseDecision = .denied,
+        answer: Loa.Value? = nil,
+        interrupting: String? = nil,
         _ handler: @escaping Handler = { _ in .value(.null) }
     ) {
         self.handler = handler
         self.settlement = settlement
         self.release = release
+        self.answer = answer
+        self.interrupting = interrupting
     }
 
-    func call(_ call: Loa.Call) async -> Loa.CallOutcome {
+    func call(_ call: Loa.Call) async throws -> Loa.CallOutcome {
+        if call.qualifiedName == interrupting { throw HeldForApproval() }
         calls.append(call)
         return handler(call)
+    }
+
+    func ask(_ question: Loa.Question, call: Loa.Call) async throws -> Loa.Value? {
+        answer
     }
 
     func settle(_ call: Loa.Call) async -> Loa.Settlement {

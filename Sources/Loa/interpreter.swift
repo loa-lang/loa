@@ -106,13 +106,16 @@ public extension Loa {
         public let failure: RuntimeFailure?
         /// Set when the run waits for the owner; the program has not failed.
         public let suspension: Suspension?
+        /// An error the executor threw (a pending approval, cancellation). The call it was
+        /// running is recorded as `pending`, so a later run tries it again.
+        public let interruption: (any Error)?
         /// The ledger with this run's entries appended.
         public let ledger: Ledger
         /// This run's number in the ledger.
         public let run: Int
 
         /// Ran to the end.
-        public var succeeded: Bool { failure == nil && suspension == nil }
+        public var succeeded: Bool { failure == nil && suspension == nil && interruption == nil }
 
         /// The value bound to `name` on `page`, or at top level when `page` is nil.
         public func value(_ name: String, page: String? = nil) -> Value? {
@@ -173,6 +176,7 @@ public extension Loa {
             completed: result.completed,
             failure: result.failure?.located(in: map),
             suspension: result.suspension?.located(in: map),
+            interruption: result.interruption,
             ledger: result.ledger,
             run: result.run
         )
@@ -208,6 +212,11 @@ final class Interpreter {
     struct Stop: Error {
         let message: String
         let range: Loa.SourceRange
+    }
+
+    /// An error the executor threw; the run stops and hands it to the host.
+    struct HostInterruption: Error {
+        let error: any Error
     }
 
     let catalog: Loa.Catalog
@@ -257,6 +266,7 @@ final class Interpreter {
         var completed: [String] = []
         var failure: Loa.RuntimeFailure?
         var suspension: Loa.Suspension?
+        var interruption: (any Error)?
 
         items: for item in program.items {
             switch item {
@@ -272,6 +282,8 @@ final class Interpreter {
                     failure = .init(message: stop.message, range: stop.range, page: page.name)
                 } catch let waiting as Loa.Suspension {
                     suspension = waiting
+                } catch let host as HostInterruption {
+                    interruption = host.error
                 } catch {
                     failure = .init(message: "\(error)", range: page.range, page: page.name)
                 }
@@ -281,7 +293,7 @@ final class Interpreter {
                 currentPage = nil
                 sites = [:]
                 siteCounts = [:]
-                if failure != nil || suspension != nil { break items }
+                if failure != nil || suspension != nil || interruption != nil { break items }
             case .statement(let statement):
                 do {
                     if case .returned = try await execute(statement) { break items }
@@ -291,6 +303,10 @@ final class Interpreter {
                     break items
                 } catch let waiting as Loa.Suspension {
                     suspension = waiting
+                    scopes = [scopes[0]]
+                    break items
+                } catch let host as HostInterruption {
+                    interruption = host.error
                     scopes = [scopes[0]]
                     break items
                 } catch {
@@ -308,6 +324,7 @@ final class Interpreter {
             completed: completed,
             failure: failure,
             suspension: suspension,
+            interruption: interruption,
             ledger: ledger,
             run: runNumber
         )
@@ -1081,6 +1098,33 @@ final class Interpreter {
         if ledger.question(at: callIdentity) == nil {
             ledger.append(.asked(record, question), run: runNumber, page: currentPage, range: range)
         }
+        // A host with an interface answers now; otherwise the run waits for the owner.
+        if name == "ask" {
+            let call = Loa.Call(
+                domain: "loa",
+                function: name,
+                arguments: values,
+                effect: .ask,
+                page: currentPage,
+                range: range,
+                identity: callIdentity
+            )
+            let answer: Value?
+            do {
+                answer = try await executor.ask(question, call: call)
+            } catch {
+                throw HostInterruption(error: error)
+            }
+            if let answer {
+                do {
+                    try question.validate(answer)
+                } catch {
+                    throw Stop(message: "The answer to '\(question.prompt)' does not fit: \(error)", range: range)
+                }
+                ledger.append(.answered(record, answer), run: runNumber, page: currentPage, range: range)
+                return answer
+            }
+        }
         throw Loa.Suspension(
             reason: name == "ask" ? .question(question) : .pause(question),
             call: record,
@@ -1092,7 +1136,15 @@ final class Interpreter {
     /// Hands a call to the executor between an `intended` entry and its outcome.
     func perform(_ call: Loa.Call, _ record: Loa.CallRecord, function: Loa.Function) async throws -> Value {
         ledger.append(.intended(record), run: runNumber, page: currentPage, range: call.range)
-        switch await executor.call(call) {
+        let outcome: Loa.CallOutcome
+        do {
+            outcome = try await executor.call(call)
+        } catch {
+            // The host stopped before the call ran (an approval it holds): it may run later.
+            ledger.append(.pending(record, "\(error)"), run: runNumber, page: currentPage, range: call.range)
+            throw HostInterruption(error: error)
+        }
+        switch outcome {
         case .value(let value):
             ledger.append(.completed(record, value), run: runNumber, page: currentPage, range: call.range)
             return value

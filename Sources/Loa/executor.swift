@@ -74,7 +74,14 @@ public extension Loa {
     /// Runs catalog calls for the interpreter. Agentic implements it on its capability
     /// dispatcher, so approval, preflight and recovery stay where they are; tests use a fake.
     protocol Executor: Sendable {
-        func call(_ call: Call) async -> CallOutcome
+        /// Runs one call. A thrown error is the host's, not the program's (a pending approval,
+        /// cancellation): the call is recorded as `pending`, the run stops, and the error is in
+        /// `RunResult.interruption` for the host to handle.
+        func call(_ call: Call) async throws -> CallOutcome
+
+        /// Answers an `ask` now (a host with an interface), or returns nil to suspend the run
+        /// until the owner answers through the ledger.
+        func ask(_ question: Question, call: Call) async throws -> Value?
 
         /// Looks whether a call whose outcome is unknown took effect (a Message-ID in Sent,
         /// a commit with that tree). Asked only for functions the catalog marks `settles`;
@@ -88,6 +95,10 @@ public extension Loa {
 }
 
 public extension Loa.Executor {
+    func ask(_ question: Loa.Question, call: Loa.Call) async throws -> Loa.Value? {
+        nil
+    }
+
     func settle(_ call: Loa.Call) async -> Loa.Settlement {
         .cannot_tell
     }
