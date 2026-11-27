@@ -8,6 +8,7 @@ enum LoaTestSuite {
         checkerSuite
         interpreterSuite
         ledgerSuite
+        guardedSuite
     }
 
     static let syntaxSuite = TestSuite("syntax", title: "Syntax and abstract syntax") {

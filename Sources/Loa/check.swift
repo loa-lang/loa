@@ -35,6 +35,8 @@ public extension Loa {
         /// `mail.search`, or a built-in such as `ask`.
         public let function: String
         public let effect: Effect
+        /// Whether it may run again: `.guarded` calls run once per generation.
+        public let repeats: Repeats
         public let range: SourceRange
         public let page: String?
         /// Inside a `for`: the call may run many times under one approval.
@@ -107,6 +109,8 @@ final class Checker {
     var pageBindings: [String: [String: ValueType]] = [:]
     var scopes: [[String: Variable]] = [[:]]
     var loopDepth = 0
+    /// For each enclosing loop, the index its body scope gets.
+    var loopScopes: [Int] = []
     var currentPage: String?
     var diagnostics: [Loa.Diagnostic] = []
     var effects: [Loa.EffectUse] = []
@@ -205,7 +209,9 @@ final class Checker {
                 elementType = .any
             }
             loopDepth += 1
+            loopScopes.append(scopes.count)
             scoped(body, with: [element: Variable(type: elementType, mutable: false)])
+            loopScopes.removeLast()
             loopDepth -= 1
         case .if(let condition, let then, let otherwise):
             let conditionType = resolve(type(condition, expected: .bool))
@@ -453,6 +459,9 @@ final class Checker {
                 return .value(value)
             case .try:
                 return .value(type(operand, expected: expected, root: root))
+            case .again:
+                checkAgain(operand)
+                return .value(type(operand, expected: expected, root: root))
             }
         case .binary(let op, let lhs, let rhs):
             return .value(binary(op, lhs, rhs, root: root))
@@ -683,8 +692,65 @@ final class Checker {
         if !positional.isEmpty, positional.contains(where: \.required) {
             error("Missing a positional argument for \(qualified)", range, note: signature)
         }
-        record(qualified, function.effect, at: range)
+        if function.repeats == .never && !function.settles {
+            error("\(qualified) never repeats, but the catalog gives it no settle check, so an interrupted call could not be recovered", range)
+        }
+        // A guarded call's identity includes its arguments: the same arguments in every
+        // iteration are one call, and only the first iteration would run it.
+        if function.repeats != .safe, let loop = loopScopes.last,
+           !arguments.contains(where: { argument in identifiers(in: argument.value).contains { (scopeIndex(of: $0) ?? -1) >= loop } }) {
+            warning("\(qualified) runs in a loop with the same arguments in every iteration; as a guarded call it runs only once", range)
+        }
+        record(qualified, function.effect, function.repeats, at: range)
         return function.result
+    }
+
+    /// `again` asks to repeat a guarded catalog call; anything else is a mistake.
+    func checkAgain(_ operand: Loa.Expression) {
+        guard case .call(let callee, _) = operand.kind,
+              case .member(let base, let name) = callee.kind,
+              case .identifier(let domainName) = base.kind, lookup(domainName) == nil,
+              let domain = catalog.domain(named: domainName),
+              let function = domain.function(named: name) else {
+            error("'again' applies to a call of a catalog function", operand.range)
+            return
+        }
+        let qualified = "\(domain.name).\(function.name)"
+        switch function.repeats {
+        case .safe:
+            warning("\(qualified) can run again anyway; 'again' has no effect", operand.range)
+        case .never:
+            error("\(qualified) never repeats within a goal; 'again' is not allowed", operand.range)
+        case .guarded:
+            break
+        }
+    }
+
+    /// The variable names an expression reads.
+    func identifiers(in expression: Loa.Expression) -> [String] {
+        switch expression.kind {
+        case .identifier(let name):
+            return [name]
+        case .string(let literal):
+            return literal.segments.flatMap { segment -> [String] in
+                if case .interpolation(let part) = segment { return identifiers(in: part) }
+                return []
+            }
+        case .member(let base, _):
+            return identifiers(in: base)
+        case .call(let callee, let arguments), .subscript(let callee, let arguments):
+            return identifiers(in: callee) + arguments.flatMap { identifiers(in: $0.value) }
+        case .object(let fields):
+            return fields.flatMap { identifiers(in: $0.value) }
+        case .array(let elements):
+            return elements.flatMap(identifiers(in:))
+        case .prefix(_, let operand):
+            return identifiers(in: operand)
+        case .binary(_, let lhs, let rhs):
+            return identifiers(in: lhs) + identifiers(in: rhs)
+        case .number, .boolean, .null, .implicit_member, .empty_dictionary:
+            return []
+        }
     }
 
     func builtin(_ name: String, _ arguments: [Loa.Argument], expected: ValueType?, at range: Loa.SourceRange) -> ValueType {
@@ -703,7 +769,7 @@ final class Checker {
             }
             values[key] = argument.value
         }
-        record(name, specification.effect, at: range)
+        record(name, specification.effect, name == "ask" || name == "delegate" ? .guarded : .safe, at: range)
         switch name {
         case "ask":
             if let prompt = values["_"] { _ = type(prompt, expected: .string) } else {
@@ -726,8 +792,8 @@ final class Checker {
         }
     }
 
-    func record(_ function: String, _ effect: Loa.Effect, at range: Loa.SourceRange) {
-        effects.append(.init(function: function, effect: effect, range: range,
+    func record(_ function: String, _ effect: Loa.Effect, _ repeats: Loa.Repeats, at range: Loa.SourceRange) {
+        effects.append(.init(function: function, effect: effect, repeats: repeats, range: range,
                              page: currentPage, inLoop: loopDepth > 0))
     }
 
@@ -824,6 +890,11 @@ final class Checker {
         return nil
     }
 
+    /// The index of the innermost scope that declares `name`.
+    func scopeIndex(of name: String) -> Int? {
+        scopes.indices.last { scopes[$0][name] != nil }
+    }
+
     func declare(_ name: String, type: ValueType, mutable: Bool, at range: Loa.SourceRange) {
         if scopes[scopes.count - 1][name] != nil {
             error("'\(name)' is already declared here", range)
@@ -837,6 +908,10 @@ final class Checker {
 
     func error(_ message: String, _ range: Loa.SourceRange, note: String? = nil) {
         diagnostics.append(.init(severity: .error, message: message, range: range, note: note))
+    }
+
+    func warning(_ message: String, _ range: Loa.SourceRange, note: String? = nil) {
+        diagnostics.append(.init(severity: .warning, message: message, range: range, note: note))
     }
 
     /// " Did you mean 'x'?" for the closest candidate, or nothing.

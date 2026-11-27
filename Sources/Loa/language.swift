@@ -7,7 +7,7 @@ public extension Loa {
     /// (`hits.where(…)`, `.type`).
     static let keywords = [
         "import", "let", "var", "type", "page", "step",
-        "for", "in", "if", "else", "return", "break", "continue", "try",
+        "for", "in", "if", "else", "return", "break", "continue", "try", "again",
     ]
 
     /// The Loa grammar: statements and expressions around Frame's lexical layer.
@@ -19,7 +19,7 @@ public extension Loa {
     /// expression productions are Loa's own. Identifiers do not contain `-` (subtraction).
     ///
     /// Operator precedence, loosest first: `|>`, `??`, `||`, `&&`, comparison, range
-    /// (`...`, `..<`), `+ -`, `* / %`, prefix `! - try`, then postfix `.name`, `(…)`, `[…]`.
+    /// (`...`, `..<`), `+ -`, `* / %`, prefix `! - try again`, then postfix `.name`, `(…)`, `[…]`.
     static func language() throws -> Grammar.Language {
         let values = Frame.valueGrammar()
         func t(_ name: String) -> Grammar.Expression { .symbol(.terminal(name)) }
@@ -159,7 +159,7 @@ public extension Loa {
             .init(name: "additive", expression: binary("multiplicative", ["+", "-"])),
             .init(name: "multiplicative", expression: binary("prefix", ["*", "/", "%"])),
             .init(name: "prefix", expression: .choice([
-                .sequence([.field("operator", .choice([.literal("!"), .literal("-"), keyword("try")])), p("prefix")]),
+                .sequence([.field("operator", .choice([.literal("!"), .literal("-"), keyword("try"), keyword("again")])), p("prefix")]),
                 p("postfix")
             ])),
             .init(name: "postfix", expression: .sequence([

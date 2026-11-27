@@ -46,13 +46,50 @@ public extension Loa {
 
     enum CallOutcome: Sendable {
         case value(Value)
-        /// The call ran and failed; the program receives it as a failure value.
+        /// The tool says it did not apply the call; safe to run again.
         case failure(String)
+        /// The call never reached the tool (preflight, invalid arguments, approval denied).
+        case not_run(String)
+        /// The request may or may not have taken effect (timeout, lost connection after
+        /// sending). A guarded call in this state is never repeated on its own.
+        case unknown(String)
+    }
+
+    /// The answer to "did this interrupted call happen?".
+    enum Settlement: Sendable {
+        case done(Value)
+        case not_done
+        case cannot_tell
+    }
+
+    /// The owner's answer to `again` on a call that already ran.
+    enum ReleaseDecision: Sendable {
+        case approved(reason: String?)
+        case denied
     }
 
     /// Runs catalog calls for the interpreter. Agentic implements it on its capability
     /// dispatcher, so approval, preflight and recovery stay where they are; tests use a fake.
     protocol Executor: Sendable {
         func call(_ call: Call) async -> CallOutcome
+
+        /// Looks whether a call whose outcome is unknown took effect (a Message-ID in Sent,
+        /// a commit with that tree). Asked only for functions the catalog marks `settles`;
+        /// it is a read, so it needs no approval.
+        func settle(_ call: Call) async -> Settlement
+
+        /// Asks the owner whether `call`, which already ran (`previous`), may run once more.
+        /// Only the owner decides; the program cannot release itself.
+        func release(_ call: Call, previous: CallRecord) async -> ReleaseDecision
+    }
+}
+
+public extension Loa.Executor {
+    func settle(_ call: Loa.Call) async -> Loa.Settlement {
+        .cannot_tell
+    }
+
+    func release(_ call: Loa.Call, previous: Loa.CallRecord) async -> Loa.ReleaseDecision {
+        .denied
     }
 }

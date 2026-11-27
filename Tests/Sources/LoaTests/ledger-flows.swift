@@ -61,12 +61,13 @@ extension LoaTestSuite {
             try Expect.equal(second.run, 2, "second run")
             try Expect.equal(second.failure?.description, nil, "no failure")
             let calls = await executor.calls
-            try Expect.equal(calls.map(\.identity.place), [
-                "find:_/mail.request_access#0",
-                "find:found/mail.search#0[account=team]",
-            ], "the access request (effect ask, not a read) and the failed search ran again")
+            try Expect.equal(
+                calls.map(\.identity.place),
+                ["find:found/mail.search#0[account=team]"],
+                "only the failed search ran again; the granted access request (guarded) was not repeated"
+            )
             let reused = second.ledger.entries(run: 2).filter { if case .reused = $0.kind { true } else { false } }
-            try Expect.equal(reused.count, 7, "the other seven calls were answered from the ledger")
+            try Expect.equal(reused.count, 8, "the other eight calls were answered from the ledger")
             try Expect.equal(second.value("message", page: "find"), first.value("message", page: "find"), "same result")
             try Expect.equal(second.ledger.entries.count > first.ledger.entries.count, true, "appended, not rewritten")
             try Expect.equal(Array(second.ledger.entries.prefix(first.ledger.entries.count)), first.ledger.entries, "earlier entries unchanged")
@@ -101,7 +102,7 @@ extension LoaTestSuite {
             try Expect.equal(calls.map(\.qualifiedName), ["mail.mailboxes", "mail.search"], "accounts reused; the new call and the changed search ran")
         }
 
-        Test("effects beyond reading always run; reuse can be switched off") {
+        Test("a completed mutation is not repeated; turning off reuse only affects reads") {
             let source = """
                 io.mutate(
                     path: "notes.md",
@@ -116,7 +117,7 @@ extension LoaTestSuite {
             let executor = FakeExecutor(answer)
             _ = try await Loa.run(source, catalog: TestCatalog.catalog, executor: executor, ledger: first.ledger)
             let secondNames = await executor.names
-            try Expect.equal(secondNames, ["io.mutate"], "the mutation ran again (guarding comes next); the read was reused")
+            try Expect.equal(secondNames, [], "the mutation (guarded) and the read were both answered from the ledger")
 
             let fresh = FakeExecutor(answer)
             _ = try await Loa.run(
@@ -127,7 +128,7 @@ extension LoaTestSuite {
                 options: .init(reuse: .none)
             )
             let freshNames = await fresh.names
-            try Expect.equal(freshNames, ["io.mutate", "mail.accounts"], "no reuse")
+            try Expect.equal(freshNames, ["mail.accounts"], "the read ran again; the mutation stayed guarded")
         }
     }
 }

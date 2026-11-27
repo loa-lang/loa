@@ -29,7 +29,15 @@ enum TestCatalog {
                 .init("send", parameters: [
                     .init("to", .array(.string), required: true),
                     .init("body", .string, required: true),
-                ], effect: .external),
+                ], effect: .external, settles: true),
+            ]),
+            .init("pay", functions: [
+                .init("charge", parameters: [
+                    .init("amount", .int, required: true),
+                ], effect: .external, repeats: .never, settles: true),
+                .init("refund", parameters: [
+                    .init("amount", .int, required: true),
+                ], effect: .external, repeats: .never),
             ]),
             .init("date", functions: [
                 .init("today", result: .named("Day"), effect: .pure),

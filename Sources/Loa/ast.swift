@@ -179,6 +179,8 @@ public extension Loa {
         case not = "!"
         case negate = "-"
         case `try` = "try"
+        /// Runs a guarded call that already ran once more, after the owner releases it.
+        case again = "again"
     }
 
     enum BinaryOperator: String, Sendable {

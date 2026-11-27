@@ -41,19 +41,29 @@ public extension Loa {
         public let parameters: [Parameter]
         public let result: ValueType
         public let effect: Effect
+        public let repeats: Repeats
+        /// Whether the host can tell, after an interrupted call, if it happened
+        /// (`Executor.settle`). Required for `.never`.
+        public let settles: Bool
         public let summary: String
 
+        /// `repeats` defaults by effect: reads and pure calls are `.safe`, anything else
+        /// `.guarded`, the restrictive default.
         public init(
             _ name: String,
             parameters: [Parameter] = [],
             result: ValueType = .any,
             effect: Effect,
+            repeats: Repeats? = nil,
+            settles: Bool = false,
             summary: String = ""
         ) {
             self.name = name
             self.parameters = parameters
             self.result = result
             self.effect = effect
+            self.repeats = repeats ?? (effect <= .read ? .safe : .guarded)
+            self.settles = settles
             self.summary = summary
         }
 
@@ -78,6 +88,17 @@ public extension Loa {
             self.type = type
             self.required = required
         }
+    }
+
+    /// Whether running a call again is harmless.
+    enum Repeats: String, Sendable, Hashable {
+        /// Running it again gives the same state: reads, writing exact content.
+        case safe
+        /// Must not repeat by accident: it runs once per generation; `again` asks the owner
+        /// for a new generation.
+        case guarded
+        /// Never repeats within the goal, not even with `again`.
+        case never
     }
 
     /// What running a call does to the world, ordered from harmless to consequential.

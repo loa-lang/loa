@@ -6,15 +6,35 @@ actor FakeExecutor: Loa.Executor {
     typealias Handler = @Sendable (Loa.Call) -> Loa.CallOutcome
 
     let handler: Handler
+    let settlement: Loa.Settlement
+    let release: Loa.ReleaseDecision
     private(set) var calls: [Loa.Call] = []
+    private(set) var settled: [Loa.Call] = []
+    private(set) var releases: [Loa.CallRecord] = []
 
-    init(_ handler: @escaping Handler = { _ in .value(.null) }) {
+    init(
+        settlement: Loa.Settlement = .cannot_tell,
+        release: Loa.ReleaseDecision = .denied,
+        _ handler: @escaping Handler = { _ in .value(.null) }
+    ) {
         self.handler = handler
+        self.settlement = settlement
+        self.release = release
     }
 
     func call(_ call: Loa.Call) async -> Loa.CallOutcome {
         calls.append(call)
         return handler(call)
+    }
+
+    func settle(_ call: Loa.Call) async -> Loa.Settlement {
+        settled.append(call)
+        return settlement
+    }
+
+    func release(_ call: Loa.Call, previous: Loa.CallRecord) async -> Loa.ReleaseDecision {
+        releases.append(previous)
+        return release
     }
 
     var names: [String] { calls.map(\.qualifiedName) }

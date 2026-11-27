@@ -2,14 +2,34 @@ import Foundation
 import Position
 
 public extension Loa {
+    /// A stop that waits for the owner rather than for a fix to the program.
+    enum Blocked: Sendable, Hashable {
+        /// A guarded call started without a known outcome and nothing could settle it:
+        /// the owner decides (`Ledger.settle`), then the page runs again.
+        case unknown_outcome(CallRecord)
+        /// `again` on a completed call, and the owner did not release it.
+        case release_denied(CallRecord)
+        /// `again` on a call that never repeats within a goal.
+        case never_repeats(CallRecord)
+    }
+
     /// Why a run stopped before its end.
     struct RuntimeFailure: Error, Sendable, CustomStringConvertible {
         public let message: String
         public let range: SourceRange
         /// The page that stopped; nil for top-level statements.
         public let page: String?
+        /// Set when the stop waits for the owner.
+        public var blocked: Blocked?
         public var line: Int?
         public var column: Int?
+
+        public init(message: String, range: SourceRange, page: String?, blocked: Blocked? = nil) {
+            self.message = message
+            self.range = range
+            self.page = page
+            self.blocked = blocked
+        }
 
         public var description: String {
             let position = line.flatMap { line in column.map { "\(line):\($0): " } } ?? ""
@@ -144,6 +164,7 @@ final class Interpreter {
     struct Stop: Error {
         let message: String
         let range: Loa.SourceRange
+        var blocked: Loa.Blocked? = nil
     }
 
     let catalog: Loa.Catalog
@@ -204,7 +225,7 @@ final class Interpreter {
                     _ = try await execute(page.body)
                     completed.append(page.name)
                 } catch let stop as Stop {
-                    failure = .init(message: stop.message, range: stop.range, page: page.name)
+                    failure = .init(message: stop.message, range: stop.range, page: page.name, blocked: stop.blocked)
                 } catch {
                     failure = .init(message: "\(error)", range: page.range, page: page.name)
                 }
@@ -219,7 +240,7 @@ final class Interpreter {
                 do {
                     if case .returned = try await execute(statement) { break items }
                 } catch let stop as Stop {
-                    failure = .init(message: stop.message, range: stop.range, page: nil)
+                    failure = .init(message: stop.message, range: stop.range, page: nil, blocked: stop.blocked)
                     scopes = [scopes[0]]
                     break items
                 } catch {
@@ -628,6 +649,12 @@ final class Interpreter {
         case .empty_dictionary:
             return .dictionary([])
 
+        case .prefix(.again, let operand):
+            guard case .call(let callee, let arguments) = operand.kind else {
+                throw Stop(message: "'again' applies to a call", range: range)
+            }
+            return try await call(callee, arguments, root: root, at: operand.range, again: true)
+
         case .prefix(let op, let operand):
             let value = try await evaluate(operand, root: root)
             switch (op, value) {
@@ -831,7 +858,8 @@ final class Interpreter {
         _ arguments: [Loa.Argument],
         root: Value?,
         at range: Loa.SourceRange,
-        prepending first: Value? = nil
+        prepending first: Value? = nil,
+        again: Bool = false
     ) async throws -> Value {
         switch callee.kind {
         // `.minutes(30)`: a case with associated values.
@@ -852,7 +880,7 @@ final class Interpreter {
                 guard let function = domain.function(named: name) else {
                     throw Stop(message: "\(domain.name) has no function '\(name)'", range: callee.range)
                 }
-                return try await call(function, in: domain, arguments, root: root, at: range, prepending: first)
+                return try await call(function, in: domain, arguments, root: root, at: range, prepending: first, again: again)
             }
             let receiver = try await evaluate(base, root: root)
             if first != nil {
@@ -861,7 +889,7 @@ final class Interpreter {
             return try await method(name, on: receiver, arguments, root: root, at: range)
 
         case .identifier(let name) where lookup(name) == nil && Checker.builtins.contains(name):
-            throw Stop(message: "'\(name)' needs the suspension support that comes with the ledger; not available yet", range: callee.range)
+            throw Stop(message: "'\(name)' needs suspension, which is not available yet", range: callee.range)
 
         default:
             throw Stop(message: "This is not callable", range: callee.range)
@@ -874,7 +902,8 @@ final class Interpreter {
         _ arguments: [Loa.Argument],
         root: Value?,
         at range: Loa.SourceRange,
-        prepending first: Value?
+        prepending first: Value?,
+        again: Bool
     ) async throws -> Value {
         let qualified = "\(domain.name).\(function.name)"
         var values: [Loa.ArgumentValue] = first.map { [.init(nil, $0)] } ?? []
@@ -888,39 +917,120 @@ final class Interpreter {
             values.append(.init(argument.label, value))
         }
         let callIdentity = identity(of: qualified, at: range, arguments: values)
-        let record = Loa.CallRecord(identity: callIdentity, function: qualified, effect: function.effect, arguments: values)
-
-        // A read already answered for this exact call is not repeated. Effects beyond reading
-        // always run here; guarding them is the ledger's next step.
-        if options.reuse == .reads, function.effect <= .read, let answer = ledger.answer(for: callIdentity) {
-            let value: Value
-            switch answer.kind {
-            case .completed(_, let answered), .reused(_, let answered, _): value = answered
-            default: value = .null
-            }
-            ledger.append(.reused(record, value, from: answer.sequence), run: runNumber, page: currentPage, range: range)
-            return value
+        let call = Loa.Call(
+            domain: domain.name,
+            function: function.name,
+            arguments: values,
+            effect: function.effect,
+            page: currentPage,
+            range: range,
+            identity: callIdentity
+        )
+        func record(generation: Int) -> Loa.CallRecord {
+            .init(
+                identity: callIdentity,
+                function: qualified,
+                effect: function.effect,
+                repeats: function.repeats,
+                arguments: values,
+                generation: generation,
+                again: again
+            )
         }
 
-        ledger.append(.intended(record), run: runNumber, page: currentPage, range: range)
-        let outcome = await executor.call(
-            Loa.Call(
-                domain: domain.name,
-                function: function.name,
-                arguments: values,
-                effect: function.effect,
-                page: currentPage,
-                range: range,
-                identity: callIdentity
-            )
-        )
-        switch outcome {
+        // Safe calls may run again; a read already answered for this exact call is reused.
+        if function.repeats == .safe {
+            if options.reuse == .reads, function.effect <= .read, let answer = ledger.answer(for: callIdentity) {
+                let value: Value
+                switch answer.kind {
+                case .completed(_, let answered), .reused(_, let answered, _): value = answered
+                default: value = .null
+                }
+                ledger.append(.reused(record(generation: 1), value, from: answer.sequence), run: runNumber, page: currentPage, range: range)
+                return value
+            }
+            return try await perform(call, record(generation: 1), function: function)
+        }
+
+        // Guarded and never-repeating calls run once per generation.
+        let generation = ledger.generation(of: callIdentity)
+        switch ledger.state(of: callIdentity) {
+        case .done(let value, let entry):
+            let previous = entry.call ?? record(generation: generation)
+            // `again` is satisfied once a run that asked for it has completed.
+            guard again, !previous.again else {
+                ledger.append(.reused(record(generation: generation), value, from: entry.sequence), run: runNumber, page: currentPage, range: range)
+                return value
+            }
+            if function.repeats == .never {
+                throw Stop(message: "\(qualified) never repeats within a goal", range: range, blocked: .never_repeats(previous))
+            }
+            switch await executor.release(call, previous: previous) {
+            case .approved(let reason):
+                ledger.append(.released(previous, by: .owner, reason: reason), run: runNumber, page: currentPage, range: range)
+                return try await perform(call, record(generation: generation + 1), function: function)
+            case .denied:
+                throw Stop(
+                    message: "\(qualified) already ran (run \(entry.run)) and the owner did not release it",
+                    range: range,
+                    blocked: .release_denied(previous)
+                )
+            }
+
+        case .unknown(let entry):
+            let previous = entry.call ?? record(generation: generation)
+            switch try await settle(call, previous, function: function, reason: "an earlier run stopped before its outcome was known") {
+            case .some(let value): return value
+            case .none: return try await perform(call, record(generation: generation), function: function)
+            }
+
+        case .new, .runnable:
+            return try await perform(call, record(generation: generation), function: function)
+        }
+    }
+
+    /// Hands a call to the executor between an `intended` entry and its outcome.
+    func perform(_ call: Loa.Call, _ record: Loa.CallRecord, function: Loa.Function) async throws -> Value {
+        ledger.append(.intended(record), run: runNumber, page: currentPage, range: call.range)
+        switch await executor.call(call) {
         case .value(let value):
-            ledger.append(.completed(record, value), run: runNumber, page: currentPage, range: range)
+            ledger.append(.completed(record, value), run: runNumber, page: currentPage, range: call.range)
             return value
         case .failure(let message):
-            ledger.append(.failed(record, message), run: runNumber, page: currentPage, range: range)
-            return .failure(.init(message, function: qualified))
+            ledger.append(.failed(record, message), run: runNumber, page: currentPage, range: call.range)
+            return .failure(.init(message, function: record.function))
+        case .not_run(let message):
+            ledger.append(.not_run(record, message), run: runNumber, page: currentPage, range: call.range)
+            return .failure(.init(message, function: record.function))
+        case .unknown(let message):
+            ledger.append(.unknown(record, message), run: runNumber, page: currentPage, range: call.range)
+            // A safe call can simply be tried again later.
+            if record.repeats == .safe { return .failure(.init(message, function: record.function)) }
+            switch try await settle(call, record, function: function, reason: message) {
+            case .some(let value): return value
+            case .none: return .failure(.init("not done: \(message)", function: record.function))
+            }
+        }
+    }
+
+    /// Resolves an unknown outcome with the domain's check. Returns the value when the call
+    /// took effect, nil when it did not; stops the page when nobody can tell yet.
+    func settle(_ call: Loa.Call, _ record: Loa.CallRecord, function: Loa.Function, reason: String) async throws -> Value? {
+        let blocked = Stop(
+            message: "\(record.function): outcome unknown (\(reason)); it must be settled before the page continues",
+            range: call.range,
+            blocked: .unknown_outcome(record)
+        )
+        guard function.settles else { throw blocked }
+        switch await executor.settle(call) {
+        case .done(let value):
+            ledger.append(.settled(record, done: true, value: value, by: .check), run: runNumber, page: currentPage, range: call.range)
+            return value
+        case .not_done:
+            ledger.append(.settled(record, done: false, value: nil, by: .check), run: runNumber, page: currentPage, range: call.range)
+            return nil
+        case .cannot_tell:
+            throw blocked
         }
     }
 
