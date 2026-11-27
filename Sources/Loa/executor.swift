@@ -9,6 +9,8 @@ public extension Loa {
         /// The page the call is in; nil for top-level statements.
         public let page: String?
         public let range: SourceRange
+        /// The call's ledger identity; a host can derive an idempotency key from it.
+        public let identity: CallIdentity
 
         public init(
             domain: String,
@@ -16,7 +18,8 @@ public extension Loa {
             arguments: [ArgumentValue],
             effect: Effect,
             page: String?,
-            range: SourceRange
+            range: SourceRange,
+            identity: CallIdentity
         ) {
             self.domain = domain
             self.function = function
@@ -24,6 +27,7 @@ public extension Loa {
             self.effect = effect
             self.page = page
             self.range = range
+            self.identity = identity
         }
 
         /// `mail.search`.

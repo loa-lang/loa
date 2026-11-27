@@ -44,6 +44,10 @@ public extension Loa {
         /// Pages that ran to the end, in order.
         public let completed: [String]
         public let failure: RuntimeFailure?
+        /// The ledger with this run's entries appended.
+        public let ledger: Ledger
+        /// This run's number in the ledger.
+        public let run: Int
 
         public var succeeded: Bool { failure == nil }
 
@@ -54,15 +58,24 @@ public extension Loa {
         }
     }
 
-    /// Runs a checked program. Catalog calls go to `executor`; everything else is evaluated
-    /// here. A failure stops the run and is returned with the values computed so far.
+    /// Runs a checked program. Catalog calls go to `executor`, unless `ledger` already answers
+    /// them (see `RunOptions`); everything else is evaluated here. A failure stops the run and
+    /// is returned with the values computed so far. Pass the returned ledger to the next run.
     static func run(
         _ program: Program,
         catalog: Catalog,
         executor: any Executor,
-        globals: [String: Value] = [:]
+        globals: [String: Value] = [:],
+        ledger: Ledger = .init(),
+        options: RunOptions = .init()
     ) async -> RunResult {
-        let interpreter = Interpreter(catalog: catalog, executor: executor, globals: globals)
+        let interpreter = Interpreter(
+            catalog: catalog,
+            executor: executor,
+            globals: globals,
+            ledger: ledger,
+            options: options
+        )
         return await interpreter.run(program)
     }
 
@@ -73,6 +86,8 @@ public extension Loa {
         catalog: Catalog,
         executor: any Executor,
         globals: [String: Value] = [:],
+        ledger: Ledger = .init(),
+        options: RunOptions = .init(),
         filePath: String? = nil
     ) async throws -> RunResult {
         let program = try parse(source, filePath: filePath)
@@ -81,12 +96,21 @@ public extension Loa {
         guard checked.isValid else {
             throw CheckFailure(diagnostics: checked.errors.map { $0.located(in: map) })
         }
-        let result = await run(program, catalog: catalog, executor: executor, globals: globals)
+        let result = await run(
+            program,
+            catalog: catalog,
+            executor: executor,
+            globals: globals,
+            ledger: ledger,
+            options: options
+        )
         return RunResult(
             pages: result.pages,
             bindings: result.bindings,
             completed: result.completed,
-            failure: result.failure?.located(in: map)
+            failure: result.failure?.located(in: map),
+            ledger: result.ledger,
+            run: result.run
         )
     }
 }
@@ -131,10 +155,31 @@ final class Interpreter {
     var scopes: [Scope] = [Scope()]
     var currentPage: String?
 
-    init(catalog: Loa.Catalog, executor: any Loa.Executor, globals: [String: Value]) {
+    var ledger: Loa.Ledger
+    let options: Loa.RunOptions
+    var runNumber = 0
+    /// The binding the current statement anchors its calls to (`prepare.found`), if any.
+    var anchor: String?
+    /// Names of the enclosing steps.
+    var steps: [String] = []
+    /// One key per enclosing loop iteration.
+    var iterations: [String] = []
+    /// Call sites of the current page by source offset, named once on first use.
+    var sites: [Int: String] = [:]
+    var siteCounts: [String: Int] = [:]
+
+    init(
+        catalog: Loa.Catalog,
+        executor: any Loa.Executor,
+        globals: [String: Value],
+        ledger: Loa.Ledger,
+        options: Loa.RunOptions
+    ) {
         self.catalog = catalog
         self.executor = executor
         self.globals = globals
+        self.ledger = ledger
+        self.options = options
     }
 
     // MARK: Program
@@ -144,6 +189,7 @@ final class Interpreter {
             programTypes[declaration.name] = declaration.type
         }
         pageNames = Set(program.pages.map(\.name))
+        runNumber = ledger.beginRun()
         var completed: [String] = []
         var failure: Loa.RuntimeFailure?
 
@@ -151,6 +197,8 @@ final class Interpreter {
             switch item {
             case .page(let page):
                 currentPage = page.name
+                sites = [:]
+                siteCounts = [:]
                 scopes.append(Scope())
                 do {
                     _ = try await execute(page.body)
@@ -164,6 +212,8 @@ final class Interpreter {
                 pageValues[page.name] = scopes[1].record
                 scopes = [scopes[0]]
                 currentPage = nil
+                sites = [:]
+                siteCounts = [:]
                 if failure != nil { break items }
             case .statement(let statement):
                 do {
@@ -185,7 +235,9 @@ final class Interpreter {
             pages: pageValues,
             bindings: scopes[0].record,
             completed: completed,
-            failure: failure
+            failure: failure,
+            ledger: ledger,
+            run: runNumber
         )
     }
 
@@ -207,6 +259,14 @@ final class Interpreter {
     }
 
     func execute(_ statement: Loa.Statement) async throws -> Flow {
+        let enclosing = anchor
+        defer { anchor = enclosing }
+        if case .binding(let binding) = statement.kind {
+            anchor = (steps + [binding.name]).joined(separator: ".")
+        } else {
+            anchor = nil
+        }
+
         switch statement.kind {
         case .binding(let binding):
             var value = try await evaluate(binding.value)
@@ -214,10 +274,14 @@ final class Interpreter {
                 value = try await coerce(value, to: type)
             }
             declare(binding.name, value, mutable: binding.mutable)
+            ledger.append(.bound(name: binding.name, value: value), run: runNumber, page: currentPage, range: statement.range)
             return .normal
 
         case .assignment(let target, let op, let value):
-            try await assign(target, op, try await evaluate(value), at: statement.range)
+            let name = try await assign(target, op, try await evaluate(value), at: statement.range)
+            if let updated = lookup(name)?.variable.value {
+                ledger.append(.bound(name: name, value: updated), run: runNumber, page: currentPage, range: statement.range)
+            }
             return .normal
 
         case .expression(let expression):
@@ -240,6 +304,8 @@ final class Interpreter {
                 throw Stop(message: "'for' needs a list, got \(other)", range: sequence.range)
             }
             for item in elements {
+                iterations.append("\(element)=\(iterationKey(item))")
+                defer { iterations.removeLast() }
                 let flow = try await scoped(body, with: [element: Variable(value: item, mutable: false)])
                 switch flow {
                 case .normal, .continueLoop: continue
@@ -267,10 +333,44 @@ final class Interpreter {
         case .continue:
             return .continueLoop
 
-        case .step(_, let body):
+        case .step(let name, let body):
             // Steps structure a page; their bindings belong to the page.
+            steps.append(name)
+            defer { steps.removeLast() }
             return try await execute(body)
         }
+    }
+
+    /// A loop element's key in call identities: its `id` or `name` when it has one, short
+    /// values as written, anything else by hash.
+    func iterationKey(_ value: Value) -> String {
+        if case .record(let record) = value {
+            for field in ["id", "name"] {
+                if let key = record[field], key.text.count <= 40 { return key.text }
+            }
+        }
+        let text = value.text
+        return text.count <= 40 ? text : "#" + Loa.stableHash(text)
+    }
+
+    /// The identity of a call at `range`, named once per page on first use.
+    func identity(of function: String, at range: Loa.SourceRange, arguments: [Loa.ArgumentValue]) -> Loa.CallIdentity {
+        let site: String
+        if let named = sites[range.lowerBound] {
+            site = named
+        } else {
+            let prefix = "\(anchor ?? "_")/\(function)"
+            let ordinal = siteCounts[prefix, default: 0]
+            siteCounts[prefix] = ordinal + 1
+            site = "\(prefix)#\(ordinal)"
+            sites[range.lowerBound] = site
+        }
+        return Loa.CallIdentity(
+            page: currentPage,
+            site: site,
+            iteration: iterations,
+            arguments: Loa.stableHash(arguments.map(\.description).joined(separator: ", "))
+        )
     }
 
     func declare(_ name: String, _ value: Value, mutable: Bool) {
@@ -294,7 +394,9 @@ final class Interpreter {
         case index(Value)
     }
 
-    func assign(_ target: Loa.Expression, _ op: Loa.AssignmentOperator, _ value: Value, at range: Loa.SourceRange) async throws {
+    /// Applies an assignment; returns the name of the variable it changed.
+    @discardableResult
+    func assign(_ target: Loa.Expression, _ op: Loa.AssignmentOperator, _ value: Value, at range: Loa.SourceRange) async throws -> String {
         var path: [PathStep] = []
         var root = target
         while true {
@@ -323,6 +425,7 @@ final class Interpreter {
             try self.combine(current, op, value, at: range)
         }
         scopes[found.scope].variables[name]?.value = updated
+        return name
     }
 
     func update(
@@ -784,6 +887,22 @@ final class Interpreter {
             }
             values.append(.init(argument.label, value))
         }
+        let callIdentity = identity(of: qualified, at: range, arguments: values)
+        let record = Loa.CallRecord(identity: callIdentity, function: qualified, effect: function.effect, arguments: values)
+
+        // A read already answered for this exact call is not repeated. Effects beyond reading
+        // always run here; guarding them is the ledger's next step.
+        if options.reuse == .reads, function.effect <= .read, let answer = ledger.answer(for: callIdentity) {
+            let value: Value
+            switch answer.kind {
+            case .completed(_, let answered), .reused(_, let answered, _): value = answered
+            default: value = .null
+            }
+            ledger.append(.reused(record, value, from: answer.sequence), run: runNumber, page: currentPage, range: range)
+            return value
+        }
+
+        ledger.append(.intended(record), run: runNumber, page: currentPage, range: range)
         let outcome = await executor.call(
             Loa.Call(
                 domain: domain.name,
@@ -791,13 +910,16 @@ final class Interpreter {
                 arguments: values,
                 effect: function.effect,
                 page: currentPage,
-                range: range
+                range: range,
+                identity: callIdentity
             )
         )
         switch outcome {
         case .value(let value):
+            ledger.append(.completed(record, value), run: runNumber, page: currentPage, range: range)
             return value
         case .failure(let message):
+            ledger.append(.failed(record, message), run: runNumber, page: currentPage, range: range)
             return .failure(.init(message, function: qualified))
         }
     }
