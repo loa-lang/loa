@@ -88,6 +88,12 @@ public extension Loa {
             /// Answered from an earlier entry (its sequence number) instead of calling: a read
             /// already done, or a guarded call that is not repeated.
             case reused(CallRecord, Value, from: Int)
+            /// The host holds the call until it is approved; it did not run.
+            case pending(CallRecord, String)
+            /// The program asked the owner (`ask`) or paused (`suspend`).
+            case asked(CallRecord, Question)
+            /// The owner's answer to a question or a pause.
+            case answered(CallRecord, Value)
             /// A variable got a value: a binding or an assignment.
             case bound(name: String, value: Value)
         }
@@ -103,7 +109,8 @@ public extension Loa {
         public var call: CallRecord? {
             switch kind {
             case .intended(let call), .completed(let call, _), .failed(let call, _), .not_run(let call, _),
-                 .unknown(let call, _), .settled(let call, _, _, _), .released(let call, _, _), .reused(let call, _, _):
+                 .unknown(let call, _), .settled(let call, _, _, _), .released(let call, _, _), .reused(let call, _, _),
+                 .pending(let call, _), .asked(let call, _), .answered(let call, _):
                 call
             case .bound:
                 nil
@@ -179,12 +186,12 @@ public extension Loa {
                     return .done(value, entry: entry)
                 case .settled(_, true, let value, _):
                     return .done(value ?? .null, entry: entry)
-                case .settled(_, false, _, _), .failed, .not_run:
+                case .settled(_, false, _, _), .failed, .not_run, .pending:
                     return .runnable
                 // An intent without an outcome: the process stopped in between.
                 case .intended, .unknown:
                     return .unknown(entry)
-                case .bound:
+                case .bound, .asked, .answered:
                     continue
                 }
             }
@@ -210,6 +217,48 @@ public extension Loa {
                 throw LedgerRefusal(message: "\(identity.place) has no unknown outcome to settle")
             }
             append(.settled(call, done: done, value: value, by: .owner), run: runs, page: entry.page, range: entry.range)
+        }
+
+        /// The answer the owner gave to a question or pause, if any.
+        public func answer(to identity: CallIdentity) -> LedgerEntry? {
+            entries.last { entry in
+                if case .answered(let call, _) = entry.kind { return call.identity == identity }
+                return false
+            }
+        }
+
+        /// The question asked at `identity`, if it was asked.
+        public func question(at identity: CallIdentity) -> Question? {
+            for entry in entries.reversed() {
+                if case .asked(let call, let question) = entry.kind, call.identity == identity { return question }
+            }
+            return nil
+        }
+
+        /// Questions and pauses still waiting for the owner, in the order they were asked.
+        public var open: [(call: CallRecord, question: Question)] {
+            var result: [(call: CallRecord, question: Question)] = []
+            for entry in entries {
+                guard case .asked(let call, let question) = entry.kind, answer(to: call.identity) == nil,
+                      !result.contains(where: { $0.call.identity == call.identity }) else { continue }
+                result.append((call, question))
+            }
+            return result
+        }
+
+        /// The owner answers a question (or resumes a pause with `.null`). The answer must fit
+        /// the question: one of its options, or a list of them when it allows several.
+        public mutating func answer(_ identity: CallIdentity, with value: Value) throws {
+            guard let question = question(at: identity),
+                  let asked = entries.last(where: { $0.call?.identity == identity }),
+                  let call = asked.call else {
+                throw LedgerRefusal(message: "Nothing was asked at \(identity.place)")
+            }
+            guard answer(to: identity) == nil else {
+                throw LedgerRefusal(message: "\(identity.place) is already answered")
+            }
+            try question.validate(value)
+            append(.answered(call, value), run: runs, page: asked.page, range: asked.range)
         }
 
         /// The owner reopens a completed guarded call: its next run is a new generation.
@@ -242,6 +291,53 @@ public extension Loa {
             }.flatMap { entry in
                 if case .bound(_, let value) = entry.kind { return value }
                 return nil
+            }
+        }
+    }
+
+    /// What the program asks the owner, or a pause.
+    struct Question: Sendable, Hashable {
+        public enum Kind: String, Sendable, Hashable {
+            /// `ask(…)`: wants an answer.
+            case question
+            /// `suspend(…)`: wants the owner to continue; the answer is ignored.
+            case pause
+        }
+
+        public let kind: Kind
+        public let prompt: String
+        /// The allowed answers; nil for a free text answer.
+        public let options: [Value]?
+        /// Several options may be chosen; the answer is a list.
+        public let multiple: Bool
+
+        public init(kind: Kind = .question, prompt: String, options: [Value]? = nil, multiple: Bool = false) {
+            self.kind = kind
+            self.prompt = prompt
+            self.options = options
+            self.multiple = multiple
+        }
+
+        /// Refuses an answer the question does not allow.
+        public func validate(_ answer: Value) throws {
+            if kind == .pause { return }
+            guard let options else {
+                guard case .string = answer else {
+                    throw LedgerRefusal(message: "'\(prompt)' needs a text answer")
+                }
+                return
+            }
+            let chosen: [Value]
+            if multiple {
+                guard case .array(let values) = answer else {
+                    throw LedgerRefusal(message: "'\(prompt)' takes a list of its options")
+                }
+                chosen = values
+            } else {
+                chosen = [answer]
+            }
+            for value in chosen where !options.contains(value) {
+                throw LedgerRefusal(message: "\(value) is not one of the options of '\(prompt)'")
             }
         }
     }

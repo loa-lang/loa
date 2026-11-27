@@ -66,12 +66,13 @@ extension LoaTestSuite {
         Test("an unknown outcome is never repeated on its own; the owner settles it") {
             let first = try await SendFake.run(FakeExecutor { _ in .unknown("timeout after sending") })
             try Expect.equal(
-                first.failure?.description,
+                first.suspension?.description,
                 "1:12: mail.send: outcome unknown (timeout after sending); it must be settled before the page continues",
-                "the page stops"
+                "the run suspends"
             )
-            guard case .unknown_outcome(let call)? = first.failure?.blocked else {
-                throw Loa.SyntaxFailure(message: "expected an unknown-outcome block")
+            try Expect.equal(first.failure == nil, true, "a suspension, not a failure")
+            guard let call = first.suspension?.call else {
+                throw Loa.SyntaxFailure(message: "expected a suspension")
             }
             try Expect.equal(first.ledger.unsettled.map(\.function), ["mail.send"], "listed as unsettled")
 
@@ -80,7 +81,7 @@ extension LoaTestSuite {
             let second = try await SendFake.run(ledger: first.ledger, rerun)
             let rerunCalls = await rerun.calls
             try Expect.equal(rerunCalls.count, 0, "not repeated")
-            try Expect.equal(second.failure?.blocked != nil, true, "still blocked")
+            try Expect.equal(second.suspension != nil, true, "still waiting")
 
             // The owner says it went out.
             var ledger = second.ledger

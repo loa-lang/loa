@@ -53,6 +53,9 @@ public extension Loa {
         /// The request may or may not have taken effect (timeout, lost connection after
         /// sending). A guarded call in this state is never repeated on its own.
         case unknown(String)
+        /// The host holds the call for a decision it cannot make now (an approval the owner
+        /// has not given yet). The run suspends; the call is tried again when it resumes.
+        case pending(String)
     }
 
     /// The answer to "did this interrupted call happen?".

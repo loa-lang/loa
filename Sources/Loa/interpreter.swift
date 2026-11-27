@@ -2,15 +2,58 @@ import Foundation
 import Position
 
 public extension Loa {
-    /// A stop that waits for the owner rather than for a fix to the program.
-    enum Blocked: Sendable, Hashable {
-        /// A guarded call started without a known outcome and nothing could settle it:
-        /// the owner decides (`Ledger.settle`), then the page runs again.
-        case unknown_outcome(CallRecord)
-        /// `again` on a completed call, and the owner did not release it.
-        case release_denied(CallRecord)
-        /// `again` on a call that never repeats within a goal.
-        case never_repeats(CallRecord)
+    /// A run waiting for the owner. Nothing is lost: answer through the ledger, then run the
+    /// program again with it. Everything before the suspension is answered from the ledger,
+    /// so the run resumes at the same place without repeating a call.
+    struct Suspension: Error, Sendable, CustomStringConvertible {
+        public enum Reason: Sendable, Hashable {
+            /// `ask(…)`: answer with `Ledger.answer(_:with:)`.
+            case question(Question)
+            /// `suspend(…)`: continue with `Ledger.answer(_:with: .null)`.
+            case pause(Question)
+            /// The host holds a call for an approval; run again once it is decided.
+            case approval(String)
+            /// A guarded call started and nothing could tell whether it took effect:
+            /// decide with `Ledger.settle(_:done:value:)`.
+            case unknown_outcome(String)
+        }
+
+        public let reason: Reason
+        /// The call, question or pause it waits on.
+        public let call: CallRecord
+        public let page: String?
+        public let range: SourceRange
+        public var line: Int?
+        public var column: Int?
+
+        public init(reason: Reason, call: CallRecord, page: String?, range: SourceRange) {
+            self.reason = reason
+            self.call = call
+            self.page = page
+            self.range = range
+        }
+
+        public var message: String {
+            switch reason {
+            case .question(let question): "Waiting for an answer: \(question.prompt)"
+            case .pause(let question): "Paused: \(question.prompt)"
+            case .approval(let message): "\(call.function) waits for approval: \(message)"
+            case .unknown_outcome(let reason): "\(call.function): outcome unknown (\(reason)); it must be settled before the page continues"
+            }
+        }
+
+        public var description: String {
+            let position = line.flatMap { line in column.map { "\(line):\($0): " } } ?? ""
+            return "\(position)\(message)"
+        }
+
+        func located(in map: Position.TextMap) -> Self {
+            var located = self
+            let location = Loa.location(of: range.lowerBound, in: map)
+            located.line = location?.line
+            located.column = location?.column
+            return located
+        }
     }
 
     /// Why a run stopped before its end.
@@ -19,16 +62,13 @@ public extension Loa {
         public let range: SourceRange
         /// The page that stopped; nil for top-level statements.
         public let page: String?
-        /// Set when the stop waits for the owner.
-        public var blocked: Blocked?
         public var line: Int?
         public var column: Int?
 
-        public init(message: String, range: SourceRange, page: String?, blocked: Blocked? = nil) {
+        public init(message: String, range: SourceRange, page: String?) {
             self.message = message
             self.range = range
             self.page = page
-            self.blocked = blocked
         }
 
         public var description: String {
@@ -64,12 +104,15 @@ public extension Loa {
         /// Pages that ran to the end, in order.
         public let completed: [String]
         public let failure: RuntimeFailure?
+        /// Set when the run waits for the owner; the program has not failed.
+        public let suspension: Suspension?
         /// The ledger with this run's entries appended.
         public let ledger: Ledger
         /// This run's number in the ledger.
         public let run: Int
 
-        public var succeeded: Bool { failure == nil }
+        /// Ran to the end.
+        public var succeeded: Bool { failure == nil && suspension == nil }
 
         /// The value bound to `name` on `page`, or at top level when `page` is nil.
         public func value(_ name: String, page: String? = nil) -> Value? {
@@ -129,6 +172,7 @@ public extension Loa {
             bindings: result.bindings,
             completed: result.completed,
             failure: result.failure?.located(in: map),
+            suspension: result.suspension?.located(in: map),
             ledger: result.ledger,
             run: result.run
         )
@@ -164,7 +208,6 @@ final class Interpreter {
     struct Stop: Error {
         let message: String
         let range: Loa.SourceRange
-        var blocked: Loa.Blocked? = nil
     }
 
     let catalog: Loa.Catalog
@@ -213,6 +256,7 @@ final class Interpreter {
         runNumber = ledger.beginRun()
         var completed: [String] = []
         var failure: Loa.RuntimeFailure?
+        var suspension: Loa.Suspension?
 
         items: for item in program.items {
             switch item {
@@ -225,22 +269,28 @@ final class Interpreter {
                     _ = try await execute(page.body)
                     completed.append(page.name)
                 } catch let stop as Stop {
-                    failure = .init(message: stop.message, range: stop.range, page: page.name, blocked: stop.blocked)
+                    failure = .init(message: stop.message, range: stop.range, page: page.name)
+                } catch let waiting as Loa.Suspension {
+                    suspension = waiting
                 } catch {
                     failure = .init(message: "\(error)", range: page.range, page: page.name)
                 }
-                // The page's own scope is the second; blocks above it are discarded on failure.
+                // The page's own scope is the second; blocks above it are discarded on a stop.
                 pageValues[page.name] = scopes[1].record
                 scopes = [scopes[0]]
                 currentPage = nil
                 sites = [:]
                 siteCounts = [:]
-                if failure != nil { break items }
+                if failure != nil || suspension != nil { break items }
             case .statement(let statement):
                 do {
                     if case .returned = try await execute(statement) { break items }
                 } catch let stop as Stop {
-                    failure = .init(message: stop.message, range: stop.range, page: nil, blocked: stop.blocked)
+                    failure = .init(message: stop.message, range: stop.range, page: nil)
+                    scopes = [scopes[0]]
+                    break items
+                } catch let waiting as Loa.Suspension {
+                    suspension = waiting
                     scopes = [scopes[0]]
                     break items
                 } catch {
@@ -257,6 +307,7 @@ final class Interpreter {
             bindings: scopes[0].record,
             completed: completed,
             failure: failure,
+            suspension: suspension,
             ledger: ledger,
             run: runNumber
         )
@@ -889,7 +940,7 @@ final class Interpreter {
             return try await method(name, on: receiver, arguments, root: root, at: range)
 
         case .identifier(let name) where lookup(name) == nil && Checker.builtins.contains(name):
-            throw Stop(message: "'\(name)' needs suspension, which is not available yet", range: callee.range)
+            return try await builtin(name, arguments, root: root, at: range)
 
         default:
             throw Stop(message: "This is not callable", range: callee.range)
@@ -963,7 +1014,7 @@ final class Interpreter {
                 return value
             }
             if function.repeats == .never {
-                throw Stop(message: "\(qualified) never repeats within a goal", range: range, blocked: .never_repeats(previous))
+                throw Stop(message: "\(qualified) never repeats within a goal", range: range)
             }
             switch await executor.release(call, previous: previous) {
             case .approved(let reason):
@@ -972,8 +1023,7 @@ final class Interpreter {
             case .denied:
                 throw Stop(
                     message: "\(qualified) already ran (run \(entry.run)) and the owner did not release it",
-                    range: range,
-                    blocked: .release_denied(previous)
+                    range: range
                 )
             }
 
@@ -987,6 +1037,56 @@ final class Interpreter {
         case .new, .runnable:
             return try await perform(call, record(generation: generation), function: function)
         }
+    }
+
+    /// `ask` and `suspend`: answered from the ledger when the owner has answered, otherwise
+    /// the run suspends with the question.
+    func builtin(_ name: String, _ arguments: [Loa.Argument], root: Value?, at range: Loa.SourceRange) async throws -> Value {
+        guard name == "ask" || name == "suspend" else {
+            throw Stop(message: "'\(name)' needs a host that runs it, which is not available yet", range: range)
+        }
+        var values: [Loa.ArgumentValue] = []
+        for argument in arguments {
+            let value = try await evaluate(argument.value, root: root)
+            if case .failure(let failure) = value {
+                throw Stop(message: failure.description, range: argument.value.range)
+            }
+            values.append(.init(argument.label, value))
+        }
+        var options: [Value]?
+        if let given = values.first(where: { $0.label == "options" })?.value {
+            guard case .array(let list) = given else {
+                throw Stop(message: "The options of ask must be a list", range: range)
+            }
+            options = list
+        }
+        let question = Loa.Question(
+            kind: name == "ask" ? .question : .pause,
+            prompt: values.first { $0.label == nil }?.value.text ?? "",
+            options: options,
+            multiple: values.first { $0.label == "multiple" }?.value == .bool(true)
+        )
+        let callIdentity = identity(of: name, at: range, arguments: values)
+        let record = Loa.CallRecord(
+            identity: callIdentity,
+            function: name,
+            effect: name == "ask" ? .ask : .pure,
+            repeats: .guarded,
+            arguments: values
+        )
+        if let answer = ledger.answer(to: callIdentity), case .answered(_, let value) = answer.kind {
+            ledger.append(.reused(record, value, from: answer.sequence), run: runNumber, page: currentPage, range: range)
+            return name == "suspend" ? .null : value
+        }
+        if ledger.question(at: callIdentity) == nil {
+            ledger.append(.asked(record, question), run: runNumber, page: currentPage, range: range)
+        }
+        throw Loa.Suspension(
+            reason: name == "ask" ? .question(question) : .pause(question),
+            call: record,
+            page: currentPage,
+            range: range
+        )
     }
 
     /// Hands a call to the executor between an `intended` entry and its outcome.
@@ -1010,17 +1110,16 @@ final class Interpreter {
             case .some(let value): return value
             case .none: return .failure(.init("not done: \(message)", function: record.function))
             }
+        case .pending(let message):
+            ledger.append(.pending(record, message), run: runNumber, page: currentPage, range: call.range)
+            throw Loa.Suspension(reason: .approval(message), call: record, page: currentPage, range: call.range)
         }
     }
 
     /// Resolves an unknown outcome with the domain's check. Returns the value when the call
     /// took effect, nil when it did not; stops the page when nobody can tell yet.
     func settle(_ call: Loa.Call, _ record: Loa.CallRecord, function: Loa.Function, reason: String) async throws -> Value? {
-        let blocked = Stop(
-            message: "\(record.function): outcome unknown (\(reason)); it must be settled before the page continues",
-            range: call.range,
-            blocked: .unknown_outcome(record)
-        )
+        let blocked = Loa.Suspension(reason: .unknown_outcome(reason), call: record, page: currentPage, range: call.range)
         guard function.settles else { throw blocked }
         switch await executor.settle(call) {
         case .done(let value):
